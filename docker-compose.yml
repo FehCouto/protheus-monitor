@@ -1,0 +1,166 @@
+# Monitoramento LOCAL do Protheus (Elastic + Zabbix).
+# Todas as portas publicadas ficam presas em 127.0.0.1: nada e exposto na rede.
+name: protheus-monitor
+
+x-comum: &comum
+  restart: unless-stopped
+  environment: &tz
+    TZ: ${TZ}
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  elasticsearch:
+    <<: *comum
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    environment:
+      <<: *tz
+      discovery.type: single-node
+      cluster.name: protheus-monitor
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.license.self_generated.type: basic
+    mem_limit: 2g
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  # Define a senha do usuario interno do Kibana e termina.
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    restart: "no"
+    command: >
+      bash -c "curl -s -o /dev/null -w 'kibana_system: http %{http_code}\n'
+      -u elastic:${ELASTIC_PASSWORD} -H 'Content-Type: application/json'
+      -X POST http://elasticsearch:9200/_security/user/kibana_system/_password
+      -d '{\"password\":\"${KIBANA_SYSTEM_PASSWORD}\"}'"
+
+  kibana:
+    <<: *comum
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION}
+    depends_on:
+      es-setup: { condition: service_completed_successfully }
+    environment:
+      <<: *tz
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_SYSTEM_PASSWORD}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      XPACK_SECURITY_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      TELEMETRY_OPTIN: "false"
+      TELEMETRY_ALLOWCHANGINGOPTINSTATUS: "false"
+      NODE_OPTIONS: --max-old-space-size=800
+    mem_limit: 1300m
+    ports:
+      - "127.0.0.1:5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+
+  zabbix-db:
+    <<: *comum
+    image: postgres:16-alpine
+    environment:
+      <<: *tz
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD}
+      POSTGRES_DB: zabbix
+    mem_limit: 512m
+    volumes:
+      - zbxdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zabbix -d zabbix"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  zabbix-server:
+    <<: *comum
+    image: zabbix/zabbix-server-pgsql:${ZABBIX_VERSION}
+    depends_on:
+      zabbix-db: { condition: service_healthy }
+    environment:
+      <<: *tz
+      DB_SERVER_HOST: zabbix-db
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD}
+      POSTGRES_DB: zabbix
+      ZBX_CACHESIZE: 64M
+      ZBX_STARTPOLLERS: 3
+      ZBX_STARTPINGERS: 1
+      ZBX_STARTTRAPPERS: 3
+      ZBX_STARTHTTPPOLLERS: 2
+    mem_limit: 512m
+
+  zabbix-web:
+    <<: *comum
+    image: zabbix/zabbix-web-nginx-pgsql:${ZABBIX_VERSION}
+    depends_on:
+      zabbix-db: { condition: service_healthy }
+      zabbix-server: { condition: service_started }
+    environment:
+      <<: *tz
+      PHP_TZ: ${TZ}
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_NAME: Protheus Monitor (local)
+      DB_SERVER_HOST: zabbix-db
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD}
+      POSTGRES_DB: zabbix
+    mem_limit: 384m
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  # Unico ponto que fala com o Protheus: roda as consultas (somente leitura),
+  # grava no Elasticsearch e envia os numeros para o Zabbix.
+  coletor:
+    <<: *comum
+    build: ./coletor
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+      zabbix-server: { condition: service_started }
+    env_file: .env
+    environment:
+      <<: *tz
+      ES_URL: http://elasticsearch:9200
+      ZABBIX_URL: http://zabbix-web:8080
+      ZABBIX_SERVER: zabbix-server
+    mem_limit: 256m
+    volumes:
+      - ./coletor/consultas:/app/consultas:ro
+      - coletor-estado:/app/estado
+
+  # Ferramenta avulsa: captura de tela dos painéis para conferência.
+  #   docker compose run --rm foto      -> grava PNGs em ./capturas
+  foto:
+    profiles: [ferramentas]
+    build: ./scripts/foto
+    env_file: .env
+    environment:
+      <<: *tz
+    mem_limit: 1g
+    volumes:
+      - ./capturas:/capturas
+
+volumes:
+  esdata:
+  zbxdb:
+  coletor-estado:

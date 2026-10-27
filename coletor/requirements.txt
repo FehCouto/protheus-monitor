@@ -1,0 +1,4 @@
+pymssql==2.3.*
+requests==2.32.*
+PyYAML==6.0.*
+tzdata

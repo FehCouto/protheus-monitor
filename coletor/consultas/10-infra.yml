@@ -1,0 +1,152 @@
+# Consultas de infraestrutura/operação do Protheus.
+#
+# Regras (o coletor recusa o arquivo se forem quebradas):
+#   - só SELECT, com WITH (NOLOCK) em toda tabela e D_E_L_E_T_ = ' ' em tabela de dados;
+#   - intervalo mínimo de 60s; cada consulta tem no máximo 30s para responder.
+#
+# tipo: metricas  -> 1 linha; cada coluna listada em "metricas" vira item no Zabbix
+#                    (chave protheus.<id>.<coluna>) e o conjunto vai para o índice protheus-metricas.
+# tipo: eventos   -> leitura incremental por R_E_C_N_O_ (parâmetro %(desde)s); cada linha vira documento.
+# tipo: amostras  -> várias linhas; cada execução grava uma foto no índice.
+
+- id: schedule
+  area: schedule
+  descricao: Resumo das tarefas do Schedule (SCHDTSK) de hoje
+  intervalo: 300
+  tipo: metricas
+  # TSK_STATUS: 0=aguardando, 1=executando, 2=finalizada. 3 (falha) e 5 (descartada: nenhuma
+  # tentativa e sem agente) são leitura do dado real, não há CBOX no dicionário.
+  sql: |
+    SELECT
+      SUM(CASE WHEN TSK_DIA = CONVERT(VARCHAR(8), GETDATE(), 112) AND TSK_STATUS = '2' THEN 1 ELSE 0 END) AS finalizadas,
+      SUM(CASE WHEN TSK_STATUS = '1' THEN 1 ELSE 0 END) AS executando,
+      SUM(CASE WHEN TSK_DIA = CONVERT(VARCHAR(8), GETDATE(), 112) AND TSK_STATUS = '3' THEN 1 ELSE 0 END) AS falhas,
+      SUM(CASE WHEN TSK_DIA = CONVERT(VARCHAR(8), GETDATE(), 112) AND TSK_STATUS = '5' THEN 1 ELSE 0 END) AS descartadas,
+      SUM(CASE WHEN TSK_STATUS = '5' AND TRY_CAST(TSK_DIA + ' ' + TSK_HORA AS DATETIME) >= DATEADD(HOUR, -1, GETDATE()) THEN 1 ELSE 0 END) AS descartadas_1h,
+      ISNULL(DATEDIFF(MINUTE, MAX(CASE WHEN TSK_STATUS = '2' THEN TRY_CAST(TSK_DIA + ' ' + TSK_HORA AS DATETIME) END), GETDATE()), 9999) AS min_sem_execucao,
+      ISNULL(MAX(CASE WHEN TSK_STATUS = '1' THEN DATEDIFF(MINUTE, TRY_CAST(TSK_DIA + ' ' + TSK_HORA AS DATETIME), GETDATE()) END), 0) AS min_execucao_mais_longa
+    FROM SCHDTSK WITH (NOLOCK)
+    WHERE TSK_DIA >= CONVERT(VARCHAR(8), DATEADD(DAY, -1, GETDATE()), 112) AND D_E_L_E_T_ = ' '
+  metricas:
+    finalizadas:             {nome: "Schedule: tarefas finalizadas hoje"}
+    executando:              {nome: "Schedule: tarefas em execução"}
+    falhas:                  {nome: "Schedule: tarefas com falha hoje"}
+    descartadas:             {nome: "Schedule: tarefas descartadas hoje"}
+    descartadas_1h:          {nome: "Schedule: tarefas descartadas na última hora"}
+    min_sem_execucao:        {nome: "Schedule: minutos desde a última tarefa finalizada", unidade: min}
+    min_execucao_mais_longa: {nome: "Schedule: tarefa em execução há mais tempo", unidade: min}
+  gatilhos:
+    - nome: "Schedule do Protheus parado há mais de 30 min"
+      expressao: "last({item:min_sem_execucao})>30"
+      severidade: 4
+      comentario: "Nenhuma tarefa do Schedule finalizou nos últimos 30 minutos. Verifique os agents no Configurador."
+    - nome: "Schedule descartou tarefas na última hora"
+      expressao: "last({item:descartadas_1h})>0"
+      severidade: 2
+      comentario: "Tarefas agendadas não foram executadas (status 5, zero tentativas)."
+    - nome: "Tarefa do Schedule em execução há mais de 2 horas"
+      expressao: "last({item:min_execucao_mais_longa})>120"
+      severidade: 2
+
+- id: schedule_exec
+  area: schedule
+  descricao: Cada execução do Schedule, para análise por rotina no Kibana
+  intervalo: 300
+  tipo: eventos
+  indice: protheus-schedule
+  tabela: SCHDTSK
+  chave: recno
+  reler: 600
+  carga_inicial: 15000
+  timestamp: {data: dia, hora: hora}
+  rotulos:
+    status: {"0": Aguardando, "1": Executando, "2": Finalizada, "3": Falha, "5": Descartada}
+  sql: |
+    SELECT TOP 5000
+      R_E_C_N_O_ AS recno, TSK_DIA AS dia, TSK_HORA AS hora, RTRIM(TSK_CODIGO) AS agendamento,
+      RTRIM(TSK_ROTINA) AS rotina, RTRIM(TSK_ENV) AS ambiente, TSK_EMP AS empresa, RTRIM(TSK_FILIAL) AS filial,
+      TSK_STATUS AS status, RTRIM(TSK_EXEC) AS agente, TSK_TENTAT AS tentativas
+    FROM SCHDTSK WITH (NOLOCK)
+    WHERE R_E_C_N_O_ > %(desde)s AND D_E_L_E_T_ = ' '
+    ORDER BY R_E_C_N_O_
+
+- id: proclog
+  area: processos
+  descricao: Log de processamento das rotinas (CV8) de hoje
+  intervalo: 300
+  tipo: metricas
+  # CV8_INFO conforme ProcLogAtu (fonte nativo adm/CTBXLOG.PRW):
+  # 1=início, 2=fim, 3=alerta, 4=erro, 5=cancelado pelo usuário, 6=mensagem.
+  # A janela por R_E_C_N_O_ evita varrer a tabela (o índice por data começa pela filial).
+  sql: |
+    SELECT
+      SUM(CASE WHEN CV8_INFO = '1' THEN 1 ELSE 0 END) AS iniciados,
+      SUM(CASE WHEN CV8_INFO = '3' THEN 1 ELSE 0 END) AS alertas,
+      SUM(CASE WHEN CV8_INFO = '4' THEN 1 ELSE 0 END) AS erros,
+      SUM(CASE WHEN CV8_INFO = '5' THEN 1 ELSE 0 END) AS cancelados,
+      SUM(CASE WHEN CV8_INFO = '4' AND CV8_HORA >= CONVERT(VARCHAR(5), DATEADD(HOUR, -1, GETDATE()), 108) THEN 1 ELSE 0 END) AS erros_1h
+    FROM CV8010 WITH (NOLOCK)
+    WHERE R_E_C_N_O_ > (SELECT MAX(R_E_C_N_O_) - 150000 FROM CV8010 WITH (NOLOCK))
+      AND CV8_DATA = CONVERT(VARCHAR(8), GETDATE(), 112) AND D_E_L_E_T_ = ' '
+  metricas:
+    iniciados:  {nome: "Processos: iniciados hoje"}
+    alertas:    {nome: "Processos: alertas hoje"}
+    erros:      {nome: "Processos: erros hoje"}
+    cancelados: {nome: "Processos: cancelados pelo usuário hoje"}
+    erros_1h:   {nome: "Processos: erros na última hora"}
+  gatilhos:
+    - nome: "Erro de processamento no Protheus na última hora"
+      expressao: "last({item:erros_1h})>0"
+      severidade: 2
+      comentario: "Há registro de erro (CV8_INFO=4) no log de processos. Veja o detalhe no Kibana, índice protheus-proclog."
+
+- id: proclog_eventos
+  area: processos
+  descricao: Cada linha do log de processamento (CV8), para busca no Kibana
+  intervalo: 300
+  tipo: eventos
+  indice: protheus-proclog
+  tabela: CV8010
+  chave: recno
+  carga_inicial: 30000
+  timestamp: {data: dia, hora: hora}
+  rotulos:
+    tipo: {"1": Início, "2": Fim, "3": Alerta, "4": Erro, "5": Cancelado, "6": Mensagem}
+  # O detalhe (memo) só é trazido para alerta/erro/cancelamento.
+  sql: |
+    SELECT TOP 5000
+      R_E_C_N_O_ AS recno, CV8_DATA AS dia, CV8_HORA AS hora, RTRIM(CV8_FILIAL) AS filial,
+      RTRIM(CV8_PROC) AS processo, RTRIM(CV8_SBPROC) AS subprocesso, CV8_INFO AS tipo,
+      RTRIM(CV8_USER) AS usuario, RTRIM(CV8_MSG) AS mensagem, RTRIM(CV8_IDMOV) AS id_execucao,
+      CASE WHEN CV8_INFO IN ('3', '4', '5') THEN CAST(SUBSTRING(CV8_DET, 1, 1500) AS VARCHAR(1500)) ELSE '' END AS detalhe
+    FROM CV8010 WITH (NOLOCK)
+    WHERE R_E_C_N_O_ > %(desde)s AND D_E_L_E_T_ = ' '
+    ORDER BY R_E_C_N_O_
+
+- id: usuarios
+  area: usuarios
+  descricao: Usuários que entraram no Protheus (último logon em SYS_USR_LOGIN)
+  intervalo: 300
+  tipo: metricas
+  sql: |
+    SELECT
+      COUNT(*) AS logaram_hoje,
+      SUM(CASE WHEN USR_HRLOGON >= CONVERT(VARCHAR(8), DATEADD(HOUR, -1, GETDATE()), 108) THEN 1 ELSE 0 END) AS logaram_1h
+    FROM SYS_USR_LOGIN WITH (NOLOCK)
+    WHERE USR_DTLOGON = CONVERT(VARCHAR(8), GETDATE(), 112) AND D_E_L_E_T_ = ' '
+  metricas:
+    logaram_hoje: {nome: "Usuários: entraram hoje"}
+    logaram_1h:   {nome: "Usuários: último logon na última hora"}
+
+- id: tabelas
+  area: banco
+  descricao: Foto das 40 maiores tabelas (metadado, não lê dado de negócio)
+  intervalo: 21600
+  tipo: amostras
+  indice: protheus-tabelas
+  sql: |
+    SELECT TOP 40 t.name AS tabela, SUM(p.rows) AS linhas
+    FROM sys.tables t WITH (NOLOCK)
+    JOIN sys.partitions p WITH (NOLOCK) ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+    GROUP BY t.name
+    ORDER BY SUM(p.rows) DESC

@@ -1,0 +1,24 @@
+# O que só existe na memória do AppServer, lido pelo REST do Protheus (nunca pelo banco).
+#
+# tipo: rest -> GET em "caminho" (relativo a http://<host>:<porta>/rest), com token OAuth2 do usuário
+#               PROTHEUS_REST_USER. Sem esse usuário no .env a consulta é ignorada.
+#   raiz:     objeto do JSON cujas chaves viram itens no Zabbix, como nas consultas "metricas".
+#   listas:   campos do JSON que são listas; cada item vira um documento no índice indicado.
+#
+# O endpoint é o fonte C:\ADVPL\CUSTOM\endpoint\MYMONITOR.prw. Ele enxerga apenas o AppServer que
+# atende o REST: se o REST rodar em servidor separado do SmartClient, os números são só desse servidor.
+
+- id: appserver
+  area: appserver
+  descricao: Threads e usuários do AppServer que atende o REST (GetUserInfoArray)
+  intervalo: 300
+  tipo: rest
+  caminho: /MYMONITOR/saude
+  raiz: resumo
+  metricas:
+    threads:    {nome: "AppServer: threads"}
+    usuarios:   {nome: "AppServer: usuários com thread aberta"}
+    memoria_mb: {nome: "AppServer: memória das threads", unidade: MB}
+  listas:
+    ambientes: protheus-appserver
+    rotinas:   protheus-appserver

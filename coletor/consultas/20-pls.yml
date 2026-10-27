@@ -1,0 +1,70 @@
+# Filas e volumes do SIGAPLS. Só contagens: nenhum dado de beneficiário sai do banco.
+
+- id: pls_guias
+  area: pls
+  descricao: Guias de autorização (BEA) digitadas hoje, por situação
+  intervalo: 300
+  tipo: metricas
+  # BEA_STATUS conforme PLSSTATUS("BEA") (fonte nativo plano de saude/PLSXFUN.PRW):
+  # 1=Autorizada, 2=Autorizada parcialmente, 3=Não autorizada,
+  # 4=Aguardando finalização do atendimento, 5=Aguardando liq. título, 6=Em análise pela auditoria.
+  sql: |
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN BEA_STATUS = '1' THEN 1 ELSE 0 END) AS autorizadas,
+      SUM(CASE WHEN BEA_STATUS = '2' THEN 1 ELSE 0 END) AS parciais,
+      SUM(CASE WHEN BEA_STATUS = '3' AND BEA_CANCEL <> '1' THEN 1 ELSE 0 END) AS negadas,
+      SUM(CASE WHEN BEA_STATUS = '6' THEN 1 ELSE 0 END) AS em_auditoria,
+      SUM(CASE WHEN BEA_CANCEL = '1' THEN 1 ELSE 0 END) AS canceladas
+    FROM BEA010 WITH (NOLOCK)
+    WHERE BEA_DATPRO = CONVERT(VARCHAR(8), GETDATE(), 112) AND D_E_L_E_T_ = ' '
+  metricas:
+    total:        {nome: "PLS guias: digitadas hoje"}
+    autorizadas:  {nome: "PLS guias: autorizadas hoje"}
+    parciais:     {nome: "PLS guias: autorizadas parcialmente hoje"}
+    negadas:      {nome: "PLS guias: não autorizadas hoje"}
+    em_auditoria: {nome: "PLS guias: de hoje ainda em auditoria"}
+    canceladas:   {nome: "PLS guias: canceladas hoje"}
+
+- id: pls_auditoria
+  area: pls
+  descricao: Fila da auditoria (guias em análise) dos últimos 60 dias
+  intervalo: 600
+  tipo: metricas
+  sql: |
+    SELECT
+      COUNT(*) AS fila,
+      ISNULL(DATEDIFF(DAY, TRY_CAST(MIN(BEA_DATPRO) AS DATE), GETDATE()), 0) AS dias_mais_antiga
+    FROM BEA010 WITH (NOLOCK)
+    WHERE BEA_DATPRO >= CONVERT(VARCHAR(8), DATEADD(DAY, -60, GETDATE()), 112)
+      AND BEA_STATUS = '6' AND BEA_CANCEL <> '1' AND D_E_L_E_T_ = ' '
+  metricas:
+    fila:             {nome: "PLS auditoria: guias em análise (60 dias)"}
+    dias_mais_antiga: {nome: "PLS auditoria: idade da guia mais antiga em análise", unidade: d}
+  gatilhos:
+    - nome: "Guia em análise pela auditoria há mais de 21 dias"
+      expressao: "last({item:dias_mais_antiga})>21"
+      severidade: 1
+
+- id: pls_pegs
+  area: pls
+  descricao: PEGs ativas (BCI) da competência do mês corrente, por fase
+  intervalo: 900
+  tipo: metricas
+  # BCI_FASE (SX3): 1=Em digitação, 2=Em conferência, 3=Pronto, 4=Faturada. BCI_SITUAC 1=Ativo.
+  # BCI_ANO + BCI_MES são a competência da PEG (não a data de digitação).
+  sql: |
+    SELECT
+      ISNULL(SUM(CASE WHEN BCI_FASE = '1' THEN 1 ELSE 0 END), 0) AS em_digitacao,
+      ISNULL(SUM(CASE WHEN BCI_FASE = '2' THEN 1 ELSE 0 END), 0) AS em_conferencia,
+      ISNULL(SUM(CASE WHEN BCI_FASE = '3' THEN 1 ELSE 0 END), 0) AS prontas,
+      ISNULL(SUM(CASE WHEN BCI_FASE = '4' THEN 1 ELSE 0 END), 0) AS faturadas
+    FROM BCI010 WITH (NOLOCK)
+    WHERE BCI_ANO = CONVERT(VARCHAR(4), YEAR(GETDATE()))
+      AND BCI_MES = SUBSTRING(CONVERT(VARCHAR(8), GETDATE(), 112), 5, 2)
+      AND BCI_SITUAC = '1' AND D_E_L_E_T_ = ' '
+  metricas:
+    em_digitacao:   {nome: "PLS PEGs: em digitação (mês)"}
+    em_conferencia: {nome: "PLS PEGs: em conferência (mês)"}
+    prontas:        {nome: "PLS PEGs: prontas (mês)"}
+    faturadas:      {nome: "PLS PEGs: faturadas (mês)"}
